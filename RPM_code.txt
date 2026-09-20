@@ -1,0 +1,268 @@
+# Upload the file (Colab only - skip if running elsewhere and just set
+# FILE_PATH manually below)
+try:
+    from google.colab import files
+    uploaded = files.upload()
+    FILE_PATH = list(uploaded.keys())[0]
+except ImportError:
+    FILE_PATH = "Book1.xlsx"  # change this if not using Colab
+ 
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import time
+ 
+# Client-specified CubeSat parameters
+MU_EARTH = 398600.4418  # Earth's gravitational parameter, km^3/s^2
+SAT_MASS_KG = 10.0
+THRUST_N = 1.0e-3        # 1.0 mN
+ISP_S = 1500.0
+DV_BUDGET_KMS = 0.025    # 25 m/s lifetime delta-v budget
+HBR_KM = 0.02            # assumed combined hard-body radius (20 m default)
+POC_THRESHOLD = 1e-6     # 1-in-a-million safety target
+ 
+ 
+def mean_motion(sma_km):
+    # Orbital mean motion, needed for the Clohessy-Wiltshire dynamics below
+    return np.sqrt(MU_EARTH / sma_km ** 3)
+ 
+ 
+def cw_dv_to_position_matrix(t_s, n):
+    # Clohessy-Wiltshire impulse-response matrix: maps a delta-v applied
+    # now to the resulting position shift after time t_s
+    nt = n * t_s
+    s, c = np.sin(nt), np.cos(nt)
+    return np.array([
+        [s / n,             (2 / n) * (1 - c),          0],
+        [(2 / n) * (c - 1), (1 / n) * (4 * s - 3 * n * t_s), 0],
+        [0,                 0,                          s / n],
+    ])
+ 
+ 
+# Fixed polar grid used to numerically integrate the collision-probability
+# density over the hard-body disk (built once, reused for every call)
+_POLAR_R, _POLAR_TH = np.meshgrid(
+    np.linspace(1e-6, 1.0, 40), np.linspace(0, 2 * np.pi, 80), indexing="ij")
+ 
+ 
+def poc_circular(rB, PB, hbr_km):
+    # Probability of collision: integral of the 2D Gaussian density
+    # (mean rB, covariance PB) over the disk of radius hbr_km
+    P_inv = np.linalg.inv(PB)
+    det_P = np.linalg.det(PB)
+    norm_const = 1.0 / (2 * np.pi * np.sqrt(det_P))
+    r = _POLAR_R * hbr_km
+    x = r * np.cos(_POLAR_TH) - rB[0]
+    y = r * np.sin(_POLAR_TH) - rB[1]
+    d2 = (P_inv[0, 0] * x ** 2 + 2 * P_inv[0, 1] * x * y + P_inv[1, 1] * y ** 2)
+    pdf = norm_const * np.exp(-0.5 * d2)
+    dr = r[1, 0] - r[0, 0]
+    dth = _POLAR_TH[0, 1] - _POLAR_TH[0, 0]
+    return np.sum(pdf * r) * dr * dth
+ 
+ 
+def solve_rpm(rB0, PB, hbr_km, M_bplane, poc_threshold=POC_THRESHOLD,
+              max_dv_kms=DV_BUDGET_KMS, etol=1e-9, b_max=50, fd_step=1e-9):
+    # Finds the minimum delta-v that brings PoC down to poc_threshold:
+    # 1) probability gap = target - current PoC
+    # 2) greedy step along the PoC gradient
+    # 3) iterate using the local gradient until convergence
+    def poc_of_dv(dv):
+        return poc_circular(rB0 + M_bplane @ dv, PB, hbr_km)
+ 
+    def grad_poc(dv):
+        # numerical gradient (finite differences), see module docstring
+        g = np.zeros(3)
+        base = poc_of_dv(dv)
+        for i in range(3):
+            step = np.zeros(3)
+            step[i] = fd_step
+            g[i] = (poc_of_dv(dv + step) - base) / fd_step
+        return g, base
+ 
+    poc0 = poc_of_dv(np.zeros(3))
+    dv = np.zeros(3)
+    if poc_threshold - poc0 >= 0:
+        return dv, poc0  # already safe, no maneuver needed
+ 
+    for _ in range(b_max):
+        g, poc_now = grad_poc(dv)
+        gnorm = np.linalg.norm(g)
+        if gnorm < 1e-18:
+            break
+        remaining_gap = poc_threshold - poc_now
+        step = (remaining_gap / gnorm) * (g / gnorm)
+        dv_new = dv + step
+        if np.linalg.norm(dv_new) > max_dv_kms:
+            dv_new = dv_new / np.linalg.norm(dv_new) * max_dv_kms  # respect delta-v budget
+        poc_new = poc_of_dv(dv_new)
+        if poc_new <= poc_threshold:
+            dv = dv_new
+            break
+        if np.linalg.norm(dv_new - dv) <= etol:
+            dv = dv_new
+            break
+        dv = dv_new
+ 
+    return dv, poc_of_dv(dv)
+ 
+ 
+def dv_to_fuel_kg(dv_kms, isp_s=ISP_S, dry_mass_kg=SAT_MASS_KG):
+    # Tsiolkovsky rocket equation: fuel mass used for a given delta-v
+    g0 = 9.80665e-3  # km/s^2
+    return dry_mass_kg * (np.exp(np.linalg.norm(dv_kms) / (isp_s * g0)) - 1)
+ 
+ 
+def burn_duration_s(dv_kms, mass_kg=SAT_MASS_KG, thrust_N=THRUST_N):
+    # Time needed to deliver this delta-v at constant thrust (F = ma).
+    # With a 1.0 mN thruster this is far from instantaneous, worth
+    # checking against the project's 300-second threat-to-burn window.
+    dv_ms = np.linalg.norm(dv_kms) * 1000
+    return (dv_ms * mass_kg) / thrust_N
+ 
+ 
+# Load the Excel file and auto-detect risk-tier blocks
+df_raw = pd.read_excel(FILE_PATH, sheet_name=0)
+ 
+REQUIRED_COLS = ["event_id", "time_to_tca", "relative_position_r",
+                  "relative_position_n", "t_sigma_r", "t_sigma_n",
+                  "c_sigma_r", "c_sigma_n", "t_j2k_sma"]
+missing_cols = [c for c in REQUIRED_COLS if c not in df_raw.columns]
+if missing_cols:
+    raise ValueError(f"File is missing required columns: {missing_cols}")
+ 
+# Tag each row with its risk tier, based on any text-label rows found in
+# the event_id column (e.g. "Low Risk"); numeric rows below a label
+# belong to that tier until the next label appears
+tiers = []
+current_tier = "All"
+event_ids = []
+for val in df_raw["event_id"]:
+    if isinstance(val, str):
+        current_tier = val
+        event_ids.append(None)
+    else:
+        event_ids.append(val)
+    tiers.append(current_tier)
+df_raw = df_raw.copy()
+df_raw["tier"] = tiers
+df_raw["event_id_clean"] = event_ids
+df = df_raw.dropna(subset=["event_id_clean"]).copy()
+df["event_id_clean"] = df["event_id_clean"].astype(int)
+ 
+# Drop rows missing the fields needed to compute PoC (some real CDMs are
+# incomplete; these events are reported and skipped rather than guessed at)
+df_valid = df.dropna(subset=["t_sigma_r", "c_sigma_r", "t_sigma_n", "c_sigma_n",
+                              "relative_position_r", "relative_position_n",
+                              "t_j2k_sma"])
+dropped_events = set(zip(df["tier"], df["event_id_clean"])) - set(zip(df_valid["tier"], df_valid["event_id_clean"]))
+if dropped_events:
+    print(f"Note: {len(dropped_events)} event(s) skipped due to missing uncertainty data: {dropped_events}")
+ 
+# For each event, keep only its most recent CDM (smallest time_to_tca),
+# since real events get updated multiple times before closest approach
+last_cdm = df_valid.loc[df_valid.groupby(["tier", "event_id_clean"])["time_to_tca"].idxmin()]
+ 
+# Run RPM on each event
+results = []
+for _, row in last_cdm.iterrows():
+    t_to_tca_s = row["time_to_tca"] * 86400.0  # days to seconds
+    sma_km = row["t_j2k_sma"]
+    rB0 = np.array([row["relative_position_r"], row["relative_position_n"]]) / 1000.0  # m to km
+ 
+    # Combined covariance = target uncertainty + chaser uncertainty
+    sigma_r_km = np.sqrt(row["t_sigma_r"] ** 2 + row["c_sigma_r"] ** 2) / 1000.0
+    sigma_n_km = np.sqrt(row["t_sigma_n"] ** 2 + row["c_sigma_n"] ** 2) / 1000.0
+    PB = np.diag([sigma_r_km ** 2, sigma_n_km ** 2])
+ 
+    n = mean_motion(sma_km)
+    M_full = cw_dv_to_position_matrix(t_to_tca_s, n)
+    M_bplane = M_full[[0, 2], :]  # Radial & Normal rows approximate the B-plane
+ 
+    t0 = time.perf_counter()
+    dv, poc_final = solve_rpm(rB0, PB, HBR_KM, M_bplane)
+    compute_time_s = time.perf_counter() - t0
+ 
+    poc0 = poc_circular(rB0, PB, HBR_KM)
+    fuel_g = dv_to_fuel_kg(dv) * 1000
+    burn_s = burn_duration_s(dv)
+ 
+    results.append({
+        "tier": row["tier"], "event_id": row["event_id_clean"],
+        "time_to_tca_days": row["time_to_tca"],
+        "dataset_risk_log10": row.get("risk", np.nan),
+        "miss_distance_m": row.get("miss_distance", np.nan),
+        "our_poc_before": poc0,
+        "poc_after": poc_final,
+        "dv_ms": np.linalg.norm(dv) * 1000,
+        "fuel_g": fuel_g,
+        "compute_ms": compute_time_s * 1000,
+        "burn_s": burn_s,
+        "burn_fits_300s": burn_s <= 300,
+        "burn_fits_warning": burn_s <= t_to_tca_s,
+        "within_dv_budget": np.linalg.norm(dv) <= DV_BUDGET_KMS,
+        "safety_ok": poc_final <= POC_THRESHOLD * 1.05,
+        "combined_sigma_r_m": sigma_r_km * 1000,
+        "combined_sigma_n_m": sigma_n_km * 1000,
+    })
+ 
+results_df = pd.DataFrame(results)
+print(results_df.to_string(index=False))
+ 
+# Plot: 4-panel summary of the results
+labels = [f"{r.tier}\n#{r.event_id}" for r in results_df.itertuples()]
+poc_before = results_df["our_poc_before"].to_numpy()
+dataset_risk_log10 = results_df["dataset_risk_log10"].to_numpy()
+dv_ms = results_df["dv_ms"].to_numpy()
+miss_dist = results_df["miss_distance_m"].to_numpy()
+combined_sigma = np.sqrt(results_df["combined_sigma_r_m"]**2 + results_df["combined_sigma_n_m"]**2).to_numpy()
+colors = ["#C44E52" if p > POC_THRESHOLD else "#4C72B0" for p in poc_before]
+ 
+fig, axes = plt.subplots(2, 2, figsize=(13, 10))
+ 
+# Panel 1: collision probability before maneuver, vs the safety threshold
+axes[0, 0].bar(labels, np.clip(poc_before, 1e-30, None), color=colors)
+axes[0, 0].axhline(POC_THRESHOLD, color="gray", linestyle="--", label="Safety target (1e-6)")
+axes[0, 0].set_yscale("log")
+axes[0, 0].set_title("Collision Probability Before Maneuver")
+axes[0, 0].set_ylabel("Probability of Collision")
+axes[0, 0].legend()
+ 
+# Panel 2: sanity check - our PoC estimate vs the dataset's own risk value
+# (excludes -30, ESA's sentinel value for "undefined/not computable")
+valid = dataset_risk_log10 > -29
+our_log10 = np.log10(np.clip(poc_before, 1e-30, None))
+axes[0, 1].scatter(dataset_risk_log10[valid], our_log10[valid], color="#55A868", s=80, zorder=3)
+for i in np.where(valid)[0]:
+    axes[0, 1].annotate(labels[i].replace("\n", " "), (dataset_risk_log10[i], our_log10[i]),
+                         textcoords="offset points", xytext=(6, 4), fontsize=8)
+lims = [-12, -2]
+axes[0, 1].plot(lims, lims, color="gray", linestyle=":", label="Perfect agreement")
+axes[0, 1].set_xlim(lims); axes[0, 1].set_ylim(lims)
+axes[0, 1].set_title("Our PoC Model vs Dataset's Own Risk")
+axes[0, 1].set_xlabel("Dataset risk, log10(PoC)")
+axes[0, 1].set_ylabel("Our model, log10(PoC)")
+axes[0, 1].legend()
+ 
+# Panel 3: delta-v required per event (mostly zero, except genuine threats)
+axes[1, 0].bar(labels, dv_ms, color="#8172B2")
+axes[1, 0].set_title("Delta-v Required per Event")
+axes[1, 0].set_ylabel("Delta-v (m/s)")
+ 
+# Panel 4: what drives risk - miss distance vs tracking uncertainty
+sizes = 200 + 3000 * (poc_before / poc_before.max() if poc_before.max() > 0 else 0)
+axes[1, 1].scatter(miss_dist, combined_sigma, s=sizes, c=colors, alpha=0.7, edgecolor="black")
+for i, lab in enumerate(labels):
+    axes[1, 1].annotate(lab.replace("\n", " "), (miss_dist[i], combined_sigma[i]),
+                         textcoords="offset points", xytext=(8, 5), fontsize=8)
+axes[1, 1].set_title("Miss Distance vs Position Uncertainty\n(bubble size = collision risk)")
+axes[1, 1].set_xlabel("Miss distance (m)")
+axes[1, 1].set_ylabel("Combined position uncertainty (m)")
+ 
+plt.tight_layout()
+plt.savefig("real_data_analysis.png", dpi=150)
+plt.show()
+ 
+print(f"\nTotal fuel across all maneuvers: {results_df['fuel_g'].sum():.4f} g")
+print(f"Events needing a maneuver: {(results_df['dv_ms'] > 0).sum()} / {len(results_df)}")
+print(f"All within 25 m/s delta-v budget: {results_df['within_dv_budget'].all()}")
