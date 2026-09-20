@@ -1,4 +1,3 @@
-README.md
 Autonomous CubeSat Collision Avoidance Framework
 Overview
 
